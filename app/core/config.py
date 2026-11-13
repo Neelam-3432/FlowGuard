@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     testing: bool = False
     api_v1_str: str = "/api/v1"
     database_url: str = "sqlite:///./flowguard.db"
+    max_retries: int = 3
 
     model_config = SettingsConfigDict(case_sensitive=True)
 

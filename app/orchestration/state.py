@@ -11,6 +11,8 @@ class ApplicationStatus(str, Enum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    RETRY_PENDING = "RETRY_PENDING"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
     FAILED = "FAILED"
 
 
@@ -19,11 +21,20 @@ VALID_TRANSITIONS: Dict[str, Set[str]] = {
     ApplicationStatus.PENDING.value: {
         ApplicationStatus.APPROVED.value,
         ApplicationStatus.REJECTED.value,
+        ApplicationStatus.RETRY_PENDING.value,
+        ApplicationStatus.MANUAL_REVIEW.value,
         ApplicationStatus.FAILED.value,
     },
-    ApplicationStatus.APPROVED.value: set(),  # Terminal state
-    ApplicationStatus.REJECTED.value: set(),  # Terminal state
-    ApplicationStatus.FAILED.value: set(),    # Terminal state
+    ApplicationStatus.RETRY_PENDING.value: {
+        ApplicationStatus.APPROVED.value,
+        ApplicationStatus.RETRY_PENDING.value,
+        ApplicationStatus.MANUAL_REVIEW.value,
+        ApplicationStatus.FAILED.value,
+    },
+    ApplicationStatus.APPROVED.value: set(),       # Terminal state
+    ApplicationStatus.REJECTED.value: set(),       # Terminal state
+    ApplicationStatus.MANUAL_REVIEW.value: set(),  # Terminal state for automated retries
+    ApplicationStatus.FAILED.value: set(),         # Terminal state
 }
 
 
@@ -42,7 +53,11 @@ def validate_state_transition(current_state: str, new_state: str) -> None:
         )
 
 
-def is_terminal_state(state: str) -> bool:
-    """Check whether a given state is terminal (no further transitions allowed)."""
-    return len(VALID_TRANSITIONS.get(state, set())) == 0
+def is_eligible_for_retry(state: str) -> bool:
+    """Check whether an application in the given state is eligible for retry."""
+    return state == ApplicationStatus.RETRY_PENDING.value
 
+
+def is_terminal_state(state: str) -> bool:
+    """Check whether a given state is terminal (no further automated transitions allowed)."""
+    return len(VALID_TRANSITIONS.get(state, set())) == 0

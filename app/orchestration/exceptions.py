@@ -25,3 +25,17 @@ class InvalidStateTransitionError(OrchestrationError):
     """Raised when an illegal or disallowed application state transition is attempted."""
     pass
 
+
+class ApplicationNotFoundError(OrchestrationError):
+    """Raised when an application is not found by ID."""
+    pass
+
+
+class IneligibleRetryError(OrchestrationError):
+    """Raised when attempting to retry an application that is not in RETRY_PENDING status."""
+    pass
+
+
+class RetryLimitExceededError(OrchestrationError):
+    """Raised when retry attempts exceed the configured maximum threshold."""
+    pass

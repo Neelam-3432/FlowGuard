@@ -32,7 +32,7 @@ FlowGuard/
 │   │       ├── router.py               # v1 API router aggregator (health + applications)
 │   │       └── endpoints/              # Route handlers
 │   │           ├── __init__.py
-│   │           ├── applications.py     # POST /api/v1/applications/ (Phase 3)
+│   │           ├── applications.py     # POST /api/v1/applications/ & /{id}/retry (Phase 3 & 4)
 │   │           └── health.py           # Health check endpoint (GET /health)
 │   ├── core/                           # Core system configurations
 │   │   ├── __init__.py
@@ -57,12 +57,15 @@ FlowGuard/
 │   │   └── schemas.py                  # Pydantic schemas for Mandatory, Threshold, Conditional, Group rules
 │   ├── schemas/                        # System-wide Pydantic schemas
 │   │   ├── __init__.py
-│   │   ├── application.py              # Application submission & response schemas (Phase 3)
+│   │   ├── application.py              # Application submission & response schemas (Phase 3 & 4)
 │   │   └── health.py                   # Health check payload schema
-│   └── services/                       # Service layer & atomic persistence (Phase 1)
-│       ├── __init__.py
-│       ├── application_service.py      # Atomic application & audit updates
-│       └── workflow_config_service.py  # Configuration versioning and immutability
+│   ├── services/                       # Service layer & atomic persistence (Phase 1)
+│   │   ├── __init__.py
+│   │   ├── application_service.py      # Atomic application & audit updates
+│   │   └── workflow_config_service.py  # Configuration versioning and immutability
+│   └── verification/                   # External Verification Simulation (Phase 4)
+│       ├── __init__.py                 # Verification package exports
+│       └── simulator.py                # Deterministic ExternalVerificationSimulator
 ├── tests/                              # Automated test suite
 │   ├── __init__.py
 │   ├── conftest.py                     # Pytest fixtures (TestClient, isolated DB sessions)
@@ -74,6 +77,7 @@ FlowGuard/
 │   ├── test_idempotency.py             # Idempotency replay & conflict tests (Phase 3)
 │   ├── test_models.py                  # Model insertion, relationships, FKs, constraints (Phase 1)
 │   ├── test_operators.py               # Safe operator whitelist & operand type tests (Phase 2)
+│   ├── test_resilience_and_retries.py  # Resilience, retries, simulator & idempotency tests (Phase 4)
 │   ├── test_rule_evaluator.py          # Rules evaluation engine tests (Phase 2)
 │   ├── test_rule_schemas.py            # Pydantic schema validation & bounds tests (Phase 2)
 │   ├── test_transactions.py            # Transaction management tests (Phase 1)
@@ -128,12 +132,18 @@ sequenceDiagram
 ```
 
 ### Application State Machine:
-- **States:** `PENDING`, `APPROVED`, `REJECTED`, `FAILED`.
+- **States:** `PENDING`, `APPROVED`, `REJECTED`, `RETRY_PENDING`, `MANUAL_REVIEW`, `FAILED`.
 - **Transitions:**
-  - `PENDING` $\to$ `APPROVED` (Rules passed)
-  - `PENDING` $\to$ `REJECTED` (Rules failed)
-  - `PENDING` $\to$ `FAILED` (Processing error)
-  - Terminal states (`APPROVED`, `REJECTED`, `FAILED`) cannot be transitioned again. Attempts raise `InvalidStateTransitionError`.
+  - `PENDING` $\to$ `APPROVED` (Rules passed & verification succeeded)
+  - `PENDING` $\to$ `RETRY_PENDING` (Rules passed, transient verification failure, `max_retries > 0`)
+  - `PENDING` $\to$ `MANUAL_REVIEW` (Rules passed, transient verification failure, `max_retries == 0`)
+  - `PENDING` $\to$ `REJECTED` (Rules failed, permanent business rejection)
+  - `PENDING` $\to$ `FAILED` (Persistent verification failure)
+  - `RETRY_PENDING` $\to$ `APPROVED` (Retry succeeded)
+  - `RETRY_PENDING` $\to$ `RETRY_PENDING` (Retry temporary failure, attempts remaining)
+  - `RETRY_PENDING` $\to$ `MANUAL_REVIEW` (Retry temporary failure, max retries reached)
+  - `RETRY_PENDING` $\to$ `FAILED` (Retry persistent failure)
+  - Terminal states (`APPROVED`, `REJECTED`, `MANUAL_REVIEW`, `FAILED`) cannot be retried.
 
 ### Idempotency Behavior:
 - **Same Key + Identical Payload:** Returns `200 OK` with the existing application record. No duplicate application or audit log is created.
@@ -144,7 +154,8 @@ sequenceDiagram
 
 | Endpoint | Method | Status Codes | Description |
 | :--- | :--- | :--- | :--- |
-| `/api/v1/applications/` | `POST` | `201 Created`, `200 OK`, `400`, `404`, `409`, `422`, `500` | Process application against workflow rules |
+| `/api/v1/applications/` | `POST` | `201 Created`, `200 OK`, `400`, `404`, `409`, `422`, `500` | Process application against workflow rules & external verification |
+| `/api/v1/applications/{application_id}/retry` | `POST` | `200 OK`, `400 Bad Request`, `404 Not Found` | Retry an eligible application in `RETRY_PENDING` status |
 | `/health` | `GET` | `200 OK` | Platform health status |
 | `/docs` | `GET` | `200 OK` | Interactive Swagger UI |
 
@@ -205,6 +216,105 @@ sequenceDiagram
 
 ---
 
+## 🛡 Resilience, Retries & External Verification Simulator (Phase 4)
+
+FlowGuard implements failure-resistant workflow execution with bounded retries, simulated external verification, and duplicate-execution protection.
+
+### 1. External Verification Simulator
+FlowGuard decouples rule evaluation from external third-party dependencies (such as KYC, credit bureau, identity, or fraud verification APIs). During execution, verification runs **outside database transactions** to prevent long-held locks.
+
+The simulator provides deterministic behavior configurable via `input_data`:
+- **Default:** Verification succeeds (`outcome: "SUCCESS"`).
+- `simulated_verification: "SUCCESS"`: Explicit success.
+- `simulated_verification: "TEMPORARY_FAILURE"`: Simulates transient network/service timeout. Application moves to `RETRY_PENDING`.
+- `simulated_verification: "PERSISTENT_FAILURE"`: Simulates permanent fraud/identity block. Application moves to `FAILED` (never retried).
+- `simulated_verification: "TEMPORARY_ONCE"`: Fails on initial submission (`retry_count == 0`), succeeds on first retry (`retry_count >= 1`).
+- `fail_until_retry: N`: Configures recovery to occur once `retry_count >= N`.
+
+### 2. Bounded Retries & State Progression
+- **Configurable Retry Limit:** Configured globally via `MAX_RETRIES` (default `3`), with optional per-workflow override via `"max_retries": N` in `config_data`.
+- **Eligibility Checking:** Only applications in `RETRY_PENDING` status with `retry_count < max_retries` are eligible for retry.
+- **Terminal Review Transition:** When an application exhausts all permitted retry attempts, it is transitioned to `MANUAL_REVIEW` (`RETRY_EXHAUSTED_MANUAL_REVIEW`).
+- **Permanent Business Failures:** If rules evaluation fails (`REJECTED`), the decision is final and cannot be retried.
+
+### 3. Retry API (`POST /api/v1/applications/{application_id}/retry`)
+
+#### Sample Retry Request:
+```http
+POST /api/v1/applications/1/retry
+Content-Type: application/json
+```
+
+#### Sample Successful Retry Response (`200 OK`):
+```json
+{
+  "id": 1,
+  "request_id": "req-4d6102c93054",
+  "workflow_id": "loan_approval",
+  "workflow_config_id": 1,
+  "workflow_version": 1,
+  "idempotency_key": "app-idemp-001",
+  "status": "APPROVED",
+  "retry_count": 1,
+  "verification_outcome": "SUCCESS",
+  "failure_reason": null,
+  "decision": {
+    "status": "APPROVED",
+    "passed": true,
+    "total_rules": 2,
+    "passed_rules": 2,
+    "failed_rules": 0,
+    "results": [],
+    "metadata": {
+      "replayed": true,
+      "workflow_version": 1
+    }
+  },
+  "created_at": "2026-11-13T10:24:26.232939",
+  "updated_at": "2026-11-13T10:25:12.871021"
+}
+```
+
+#### Sample Exhausted Retries Response (`200 OK`):
+```json
+{
+  "id": 2,
+  "request_id": "req-8b92ef104c81",
+  "workflow_id": "loan_approval",
+  "workflow_config_id": 1,
+  "workflow_version": 1,
+  "idempotency_key": "app-idemp-002",
+  "status": "MANUAL_REVIEW",
+  "retry_count": 3,
+  "verification_outcome": "TEMPORARY_FAILURE",
+  "failure_reason": "Max retries exhausted (3/3): Temporary verification failure: external dependency unavailable or timed out.",
+  "decision": {
+    "status": "MANUAL_REVIEW",
+    "passed": true,
+    "total_rules": 2,
+    "passed_rules": 2,
+    "failed_rules": 0,
+    "results": [],
+    "metadata": {
+      "replayed": true,
+      "workflow_version": 1
+    }
+  },
+  "created_at": "2026-11-13T10:24:26.232939",
+  "updated_at": "2026-11-13T10:26:45.391219"
+}
+```
+
+### 4. Audit Trail Events
+Every retry step appends an immutable audit entry:
+- `APPLICATION_RETRY_PENDING`: Application initially placed in retry queue.
+- `RETRY_FAILED_TEMPORARY`: Retry failed due to transient error, remaining attempts exist.
+- `RETRY_SUCCEEDED`: Retry succeeded, status moved to `APPROVED`.
+- `RETRY_EXHAUSTED_MANUAL_REVIEW`: Maximum retry limit reached, status moved to `MANUAL_REVIEW`.
+- `RETRY_FAILED_PERSISTENT`: Retry encountered persistent dependency rejection, status moved to `FAILED`.
+
+---
+
 ## ⚡ Rules Engine (Phase 2)
 
 FlowGuard includes a standalone, deterministic, and secure rules engine that evaluates incoming application payloads against versioned workflow configurations without external code execution.
@@ -241,7 +351,7 @@ Interactive Docs: `http://127.0.0.1:8000/docs`
 
 ## 🧪 Running Tests
 
-To run the full automated test suite (75 tests across Phases 0, 1, 2, and 3):
+To run the full automated test suite (92 tests across Phases 0, 1, 2, 3, and 4):
 
 ```bash
 pytest -v
@@ -255,4 +365,4 @@ pytest -v
 - [x] **Phase 1:** Database & Persistence (SQLAlchemy 2.0 models, SQLite foreign keys, transactions, session management).
 - [x] **Phase 2:** Configurable Rules Engine (Pydantic v2 schemas, operator whitelist, decision traces, determinism).
 - [x] **Phase 3:** Workflow Orchestration & Application Processing API (`POST /api/v1/applications/`, state management, idempotency replay/conflict, atomic persistence).
-- [ ] **Phase 4:** Advanced operators, validation, and simulated decision testing.
+- [x] **Phase 4:** Resilience, Retries & Idempotency (external verification simulator, bounded retries, state machine expansion to RETRY_PENDING / MANUAL_REVIEW, retry API, duplicate protection).

@@ -45,8 +45,10 @@ class ApplicationResponse(BaseModel):
     workflow_config_id: int = Field(..., description="Workflow configuration database ID")
     workflow_version: int = Field(..., description="Workflow configuration version executed")
     idempotency_key: str = Field(..., description="Idempotency key")
-    status: str = Field(..., description="Current application status (APPROVED, REJECTED, FAILED)")
+    status: str = Field(..., description="Current application status (APPROVED, REJECTED, RETRY_PENDING, MANUAL_REVIEW, FAILED)")
+    retry_count: int = Field(0, description="Number of retry attempts executed")
+    verification_outcome: Optional[str] = Field(None, description="External verification outcome")
+    failure_reason: Optional[str] = Field(None, description="Failure reason description if applicable")
     decision: Optional[DecisionSummaryResponse] = Field(None, description="Detailed decision result")
     created_at: datetime = Field(..., description="Submission timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
-
