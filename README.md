@@ -2,7 +2,7 @@
 
 > **A Configurable Workflow Decision Platform**
 
-FlowGuard is a modular and extensible decision platform designed to execute configurable business workflows, rule evaluations, and decision pipelines without hardcoded logic.
+FlowGuard is a modular, extensible, and verified MVP decision platform designed to execute configurable business workflows, rule evaluations, and decision pipelines without hardcoded logic. Built as a self-contained prototype on FastAPI, SQLAlchemy 2.0, and SQLite, FlowGuard demonstrates deterministic rule evaluation, stateful workflow orchestration, bounded retry resilience, and transactional audit logging without external message brokers or distributed queue infrastructure.
 
 ---
 
@@ -12,7 +12,7 @@ FlowGuard is a modular and extensible decision platform designed to execute conf
 - **Web Framework:** [FastAPI](https://fastapi.tiangolo.com/)
 - **ASGI Server:** [Uvicorn](https://www.uvicorn.org/)
 - **Database ORM:** [SQLAlchemy](https://www.sqlalchemy.org/) 2.0+
-- **Database Engine:** SQLite (embedded, foreign keys enforced)
+- **Database Engine:** SQLite (embedded, foreign keys enforced via `PRAGMA foreign_keys=ON`)
 - **Data Validation & Settings:** [Pydantic](https://docs.pydantic.dev/) v2 & [Pydantic-Settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
 - **Testing:** [Pytest](https://docs.pytest.org/) & [HTTPX](https://www.python-httpx.org/)
 
@@ -36,16 +36,16 @@ FlowGuard/
 │   │           └── health.py           # Health check endpoint (GET /health)
 │   ├── core/                           # Core system configurations
 │   │   ├── __init__.py
-│   │   ├── config.py                   # App settings (Pydantic BaseSettings)
+│   │   ├── config.py                   # App settings (Pydantic BaseSettings, MAX_RETRIES)
 │   │   └── database.py                 # SQLite connection, FK PRAGMA, session factory
 │   ├── models/                         # SQLAlchemy 2.0 ORM models (Phase 1)
 │   │   ├── __init__.py
-│   │   ├── application.py              # Application decision entity
+│   │   ├── application.py              # Application decision entity (retry_count, status)
 │   │   ├── audit_log.py                # State transition & decision audit trail
 │   │   └── workflow_config.py          # Versioned immutable workflow configuration
-│   ├── orchestration/                  # Workflow Orchestration Layer (Phase 3)
+│   ├── orchestration/                  # Workflow Orchestration Layer (Phase 3 & 4)
 │   │   ├── __init__.py                 # Orchestration package exports
-│   │   ├── exceptions.py               # Orchestration error hierarchy
+│   │   ├── exceptions.py               # Orchestration & retry error hierarchy
 │   │   ├── orchestrator.py             # WorkflowOrchestrator implementation
 │   │   └── state.py                    # ApplicationStatus & state transition validation
 │   ├── rules/                          # Standalone Rules Engine (Phase 2)
@@ -66,7 +66,7 @@ FlowGuard/
 │   └── verification/                   # External Verification Simulation (Phase 4)
 │       ├── __init__.py                 # Verification package exports
 │       └── simulator.py                # Deterministic ExternalVerificationSimulator
-├── tests/                              # Automated test suite
+├── tests/                              # Automated test suite (92 passing tests)
 │   ├── __init__.py
 │   ├── conftest.py                     # Pytest fixtures (TestClient, isolated DB sessions)
 │   ├── test_application_api.py         # API submission, validation, & HTTP status tests (Phase 3)
@@ -92,7 +92,7 @@ FlowGuard/
 
 ## 🔄 Workflow Orchestration & Processing API (Phase 3)
 
-The orchestration layer bridges persisted workflow configurations, the rules engine, and application state transitions into an atomic execution pipeline.
+The orchestration layer bridges persisted workflow configurations, the rules engine, simulated external verification, and application state transitions into an atomic execution pipeline.
 
 ```mermaid
 sequenceDiagram
@@ -102,62 +102,74 @@ sequenceDiagram
     participant Orch as WorkflowOrchestrator
     participant DB as SQLite DB (SQLAlchemy)
     participant Engine as RulesEvaluator (Phase 2)
+    participant Sim as VerificationSimulator (Phase 4)
 
     Client->>API: Submit Application (workflow_id, idempotency_key, input_data)
     API->>Orch: process_application(db, submission)
     
     Orch->>DB: Check existing (workflow_id, idempotency_key)
     alt Idempotent Replay (Same Payload)
-        DB-->>Orch: Found existing application with identical hash
-        Orch-->>API: Replayed ProcessedApplicationResult
-        API-->>Client: 200 OK (Existing Application & Decision)
+        DB-->>Orch: Found existing application with identical payload hash
+        Orch-->>API: Replayed ProcessedApplicationResult (replayed=true)
+        API-->>Client: 200 OK (Existing Application & Decision Summary)
     else Idempotency Conflict (Different Payload)
-        DB-->>Orch: Found existing application with different hash
+        DB-->>Orch: Found existing application with different payload hash
         Orch-->>API: Raise IdempotencyConflictError
         API-->>Client: 409 Conflict
     else New Submission
         Orch->>DB: Fetch WorkflowConfig (specific version or active)
-        alt Workflow Not Found
+        alt Workflow Not Found or Inactive
             Orch-->>API: Raise WorkflowNotFoundError
             API-->>Client: 404 Not Found
         end
         Orch->>Engine: evaluate_rules(config, input_data)
         Engine-->>Orch: DecisionResult (passed, status, results, traces)
-        Orch->>Orch: Validate state transition (PENDING -> APPROVED/REJECTED)
+        alt Rules Engine Rejection
+            Orch->>Orch: Set status = REJECTED (Business Rule Failure)
+        else Rules Engine Passed
+            Orch->>Sim: verify(input_data, retry_count=0) [Outside DB Transaction]
+            Sim-->>Orch: VerificationResult (outcome, message)
+            Orch->>Orch: Determine target status (APPROVED, RETRY_PENDING, MANUAL_REVIEW, FAILED)
+        end
+        Orch->>Orch: Validate state transition
         Orch->>DB: Atomic Transaction: Persist Application + AuditLog
         DB-->>Orch: Committed
-        Orch-->>API: New ProcessedApplicationResult
+        Orch-->>API: ProcessedApplicationResult
         API-->>Client: 201 Created (Application & Decision Summary)
     end
 ```
 
-### Application State Machine:
+### Application State Machine
+
 - **States:** `PENDING`, `APPROVED`, `REJECTED`, `RETRY_PENDING`, `MANUAL_REVIEW`, `FAILED`.
-- **Transitions:**
-  - `PENDING` $\to$ `APPROVED` (Rules passed & verification succeeded)
-  - `PENDING` $\to$ `RETRY_PENDING` (Rules passed, transient verification failure, `max_retries > 0`)
-  - `PENDING` $\to$ `MANUAL_REVIEW` (Rules passed, transient verification failure, `max_retries == 0`)
-  - `PENDING` $\to$ `REJECTED` (Rules failed, permanent business rejection)
-  - `PENDING` $\to$ `FAILED` (Persistent verification failure)
-  - `RETRY_PENDING` $\to$ `APPROVED` (Retry succeeded)
-  - `RETRY_PENDING` $\to$ `RETRY_PENDING` (Retry temporary failure, attempts remaining)
-  - `RETRY_PENDING` $\to$ `MANUAL_REVIEW` (Retry temporary failure, max retries reached)
-  - `RETRY_PENDING` $\to$ `FAILED` (Retry persistent failure)
-  - Terminal states (`APPROVED`, `REJECTED`, `MANUAL_REVIEW`, `FAILED`) cannot be retried.
+- **Allowed Transitions:**
+  - `PENDING` → `APPROVED` (Rules passed and external verification succeeded)
+  - `PENDING` → `RETRY_PENDING` (Rules passed, transient verification failure, `max_retries > 0`)
+  - `PENDING` → `MANUAL_REVIEW` (Rules passed, transient verification failure, `max_retries == 0`)
+  - `PENDING` → `REJECTED` (Rules evaluation failed; permanent business rule rejection)
+  - `PENDING` → `FAILED` (External verification returned persistent failure)
+  - `RETRY_PENDING` → `APPROVED` (Retry attempt succeeded)
+  - `RETRY_PENDING` → `RETRY_PENDING` (Retry encountered temporary failure, retry attempts remaining)
+  - `RETRY_PENDING` → `MANUAL_REVIEW` (Retry encountered temporary failure, maximum retries exhausted)
+  - `RETRY_PENDING` → `FAILED` (Retry encountered persistent failure)
+- **Terminal States:** `APPROVED`, `REJECTED`, `MANUAL_REVIEW`, and `FAILED` are terminal for automated processing. Calling the retry endpoint on these states returns HTTP `400 Bad Request` (`IneligibleRetryError`).
 
-### Idempotency Behavior:
-- **Same Key + Identical Payload:** Returns `200 OK` with the existing application record. No duplicate application or audit log is created.
-- **Same Key + Different Payload:** Returns `409 Conflict` (`Idempotency key was already used for workflow with different submission data`).
-- **Concurrent Races:** Protected by database-level `UniqueConstraint("workflow_id", "idempotency_key")`. Collisions trigger a rollback and return the replayed record safely.
+### Idempotency & Concurrency Guarantees
 
-### API Endpoints:
+- **Identical Submission Replay:** Submitting the same `idempotency_key` and `workflow_id` with an identical payload hash returns HTTP `200 OK` with the existing application record. The decision summary is reconstructed from the original audit log (`metadata.replayed: true`), avoiding redundant workflow execution and avoiding duplicate audit logs.
+- **Payload Collision Conflict:** Reusing the same `idempotency_key` for the same `workflow_id` with a different payload returns HTTP `409 Conflict`.
+- **Database-Level Race Protection:** Concurrent submissions with the same key are protected at the database tier by SQLite's `UniqueConstraint("workflow_id", "idempotency_key")`. If near-simultaneous requests race, one transaction commits and the racing insert raises an `IntegrityError`; the orchestrator catches this, rolls back the conflicting transaction, and returns the committed record as an idempotent replay (or returns `409 Conflict` if payloads differ).
+- **MVP Scope & Limitations:** FlowGuard is designed as a single-node, embedded SQLite MVP. It does not implement distributed consensus locks (e.g., Redis Redlock) or message deduplication queues. Because external verification simulation runs before the database transaction is opened, concurrent in-flight submissions with identical keys may both execute the simulator before one is serialized and rolled back at commit time.
+
+### API Endpoints
 
 | Endpoint | Method | Status Codes | Description |
 | :--- | :--- | :--- | :--- |
 | `/api/v1/applications/` | `POST` | `201 Created`, `200 OK`, `400`, `404`, `409`, `422`, `500` | Process application against workflow rules & external verification |
 | `/api/v1/applications/{application_id}/retry` | `POST` | `200 OK`, `400 Bad Request`, `404 Not Found` | Retry an eligible application in `RETRY_PENDING` status |
 | `/health` | `GET` | `200 OK` | Platform health status |
-| `/docs` | `GET` | `200 OK` | Interactive Swagger UI |
+| `/api/v1/health` | `GET` | `200 OK` | Platform health status (v1 prefixed) |
+| `/docs` | `GET` | `200 OK` | Interactive OpenAPI / Swagger UI |
 
 #### Sample Application Submission Request (`POST /api/v1/applications/`):
 
@@ -184,6 +196,9 @@ sequenceDiagram
   "workflow_version": 1,
   "idempotency_key": "app-idemp-001",
   "status": "APPROVED",
+  "retry_count": 0,
+  "verification_outcome": "SUCCESS",
+  "failure_reason": null,
   "decision": {
     "status": "approved",
     "passed": true,
@@ -209,8 +224,8 @@ sequenceDiagram
       "config_version": 1
     }
   },
-  "created_at": "2026-11-13T10:24:26.232939",
-  "updated_at": "2026-11-13T10:24:26.232939"
+  "created_at": "2026-11-13T10:24:26.232939Z",
+  "updated_at": "2026-11-13T10:24:26.232939Z"
 }
 ```
 
@@ -221,21 +236,30 @@ sequenceDiagram
 FlowGuard implements failure-resistant workflow execution with bounded retries, simulated external verification, and duplicate-execution protection.
 
 ### 1. External Verification Simulator
-FlowGuard decouples rule evaluation from external third-party dependencies (such as KYC, credit bureau, identity, or fraud verification APIs). During execution, verification runs **outside database transactions** to prevent long-held locks.
+FlowGuard decouples internal business rule evaluation from external third-party dependencies (such as KYC, credit bureaus, identity checks, or fraud detection APIs). In this MVP, no real network calls are made. External dependencies are modeled deterministically using the built-in `ExternalVerificationSimulator`.
 
-The simulator provides deterministic behavior configurable via `input_data`:
-- **Default:** Verification succeeds (`outcome: "SUCCESS"`).
-- `simulated_verification: "SUCCESS"`: Explicit success.
-- `simulated_verification: "TEMPORARY_FAILURE"`: Simulates transient network/service timeout. Application moves to `RETRY_PENDING`.
-- `simulated_verification: "PERSISTENT_FAILURE"`: Simulates permanent fraud/identity block. Application moves to `FAILED` (never retried).
-- `simulated_verification: "TEMPORARY_ONCE"`: Fails on initial submission (`retry_count == 0`), succeeds on first retry (`retry_count >= 1`).
-- `fail_until_retry: N`: Configures recovery to occur once `retry_count >= N`.
+Key Simulator Characteristics:
+- **Simulated Environment:** No external network sockets, credentials, or live third-party services are accessed.
+- **Transaction Isolation:** Verification executes **strictly outside database transactions** to guarantee that simulated latency does not hold SQLite database locks open.
+- **Configurable via Directives:** For deterministic testing and demonstration, simulation behaviors can be controlled via input fields in the application payload:
+  - **Default (no directive):** Returns `SUCCESS` (`outcome: "SUCCESS"`).
+  - `simulated_verification: "SUCCESS"`: Explicit success.
+  - `simulated_verification: "TEMPORARY_FAILURE"`: Simulates a transient network/service timeout. Moves application to `RETRY_PENDING`.
+  - `simulated_verification: "PERSISTENT_FAILURE"`: Simulates a permanent fraud or identity verification rejection. Moves application directly to `FAILED` (ineligible for retries).
+  - `simulated_verification: "TEMPORARY_ONCE"`: Fails on initial submission (`retry_count == 0`), but recovers and succeeds on retry (`retry_count >= 1`).
+  - `fail_until_retry: N`: Configures the simulator to fail until `retry_count >= N`, then recover to `SUCCESS`.
 
 ### 2. Bounded Retries & State Progression
-- **Configurable Retry Limit:** Configured globally via `MAX_RETRIES` (default `3`), with optional per-workflow override via `"max_retries": N` in `config_data`.
-- **Eligibility Checking:** Only applications in `RETRY_PENDING` status with `retry_count < max_retries` are eligible for retry.
-- **Terminal Review Transition:** When an application exhausts all permitted retry attempts, it is transitioned to `MANUAL_REVIEW` (`RETRY_EXHAUSTED_MANUAL_REVIEW`).
-- **Permanent Business Failures:** If rules evaluation fails (`REJECTED`), the decision is final and cannot be retried.
+
+- **Configuration Precedence:**
+  - **Global System Default:** Configured via `settings.max_retries` (environment variable `MAX_RETRIES`, defaults to `3`).
+  - **Per-Workflow Override:** Can be customized per workflow configuration version by specifying `"max_retries": <int>` at the top level of `config_data` in `WorkflowConfig` (e.g., `"max_retries": 5` or `"max_retries": 0`).
+  - **Precedence Rule:** If `"max_retries"` is specified in the workflow's `config_data`, it takes precedence over the global setting; otherwise, `settings.max_retries` is used.
+- **Eligibility Checking:** Only applications currently in `RETRY_PENDING` status are eligible for retry.
+- **Retry Exhaustion:** Each retry increment is tracked on `application.retry_count`. When `retry_count >= max_retries`, the application transitions to `MANUAL_REVIEW` (`RETRY_EXHAUSTED_MANUAL_REVIEW`).
+- **Immediate Manual Review (`max_retries == 0`):** If a workflow config specifies `max_retries: 0`, any transient verification failure moves the application directly from `PENDING` to `MANUAL_REVIEW` on initial submission without entering `RETRY_PENDING`.
+- **Permanent Business Failures:** Applications failing rules engine evaluation transition to `REJECTED`. Business rule rejections are permanent and cannot be retried.
+- **Terminal States:** Applications in `APPROVED`, `REJECTED`, `FAILED`, or `MANUAL_REVIEW` cannot be retried. Attempts return HTTP `400 Bad Request`.
 
 ### 3. Retry API (`POST /api/v1/applications/{application_id}/retry`)
 
@@ -270,8 +294,8 @@ Content-Type: application/json
       "workflow_version": 1
     }
   },
-  "created_at": "2026-11-13T10:24:26.232939",
-  "updated_at": "2026-11-13T10:25:12.871021"
+  "created_at": "2026-11-13T10:24:26.232939Z",
+  "updated_at": "2026-11-13T10:25:12.871021Z"
 }
 ```
 
@@ -300,18 +324,31 @@ Content-Type: application/json
       "workflow_version": 1
     }
   },
-  "created_at": "2026-11-13T10:24:26.232939",
-  "updated_at": "2026-11-13T10:26:45.391219"
+  "created_at": "2026-11-13T10:24:26.232939Z",
+  "updated_at": "2026-11-13T10:26:45.391219Z"
 }
 ```
 
-### 4. Audit Trail Events
-Every retry step appends an immutable audit entry:
-- `APPLICATION_RETRY_PENDING`: Application initially placed in retry queue.
-- `RETRY_FAILED_TEMPORARY`: Retry failed due to transient error, remaining attempts exist.
-- `RETRY_SUCCEEDED`: Retry succeeded, status moved to `APPROVED`.
-- `RETRY_EXHAUSTED_MANUAL_REVIEW`: Maximum retry limit reached, status moved to `MANUAL_REVIEW`.
-- `RETRY_FAILED_PERSISTENT`: Retry encountered persistent dependency rejection, status moved to `FAILED`.
+> [!NOTE]
+> **Understanding Response Metadata (`replayed: true`):**
+> On fresh evaluation during initial submission, `decision.metadata` contains live evaluation details (`mandatory_failed`, `config_version`) and `results` lists all evaluated rules.
+> When a response is reconstructed (during an idempotent replay of `POST /api/v1/applications/` or during a retry via `POST /api/v1/applications/{id}/retry`), the decision summary is reconstructed from the initial audit log rather than re-running the rules engine. In these reconstructed summaries, `metadata.replayed` is set to `true`, and `results` is an empty list (`[]`) because the historical decision summary is replayed.
+
+### 4. Audit Trail Events & Persistence Scope
+
+Every lifecycle transition appends an audit entry with structured details:
+- `APPLICATION_APPROVED`: Application passed rules and external verification on initial submission.
+- `APPLICATION_REJECTED`: Application failed business rules evaluation (terminal).
+- `APPLICATION_RETRY_PENDING`: Application initially placed in retry queue due to transient verification failure.
+- `APPLICATION_FAILED`: Application failed due to persistent verification rejection.
+- `TRANSITIONED_TO_MANUAL_REVIEW`: Application transitioned to manual review on initial submission (`max_retries == 0`).
+- `RETRY_FAILED_TEMPORARY`: Retry failed due to transient error, remaining retry attempts exist.
+- `RETRY_SUCCEEDED`: Retry succeeded, application status transitioned to `APPROVED`.
+- `RETRY_EXHAUSTED_MANUAL_REVIEW`: Maximum retry limit reached on retry attempt, application moved to `MANUAL_REVIEW`.
+- `RETRY_FAILED_PERSISTENT`: Retry encountered persistent dependency rejection, application moved to `FAILED`.
+
+**Audit Trail Immutability Scope:**
+Audit log immutability is maintained **at the application and service layer**: the platform only performs `INSERT` operations on `AuditLog` and provides no update or delete routes. The underlying SQLite database does not enforce hardware write-once media or database-level update triggers.
 
 ---
 
@@ -322,8 +359,8 @@ FlowGuard includes a standalone, deterministic, and secure rules engine that eva
 ### Supported Rule Categories:
 1. **Mandatory Field Rules (`mandatory`):** Verifies required fields exist, are not null, and (optionally) non-empty strings.
 2. **Threshold Rules (`threshold`):** Performs numeric comparisons (`gt`, `gte`, `lt`, `lte`, `eq`, `ne`) against configured boundaries.
-3. **Conditional Rules (`conditional`):** Evaluates logical implications (`when` antecedent $\to$ `then` assertion).
-4. **Group Rules (`group`):** Evaluates composite conditions using `AND` and `OR` combinators with bounded recursion depth (max depth $\le 3$).
+3. **Conditional Rules (`conditional`):** Evaluates logical implications (`when` antecedent → `then` assertion).
+4. **Group Rules (`group`):** Evaluates composite conditions using `AND` and `OR` combinators with bounded recursion depth (max depth ≤ 3).
 
 ### Safe Operator Whitelist:
 Only predefined, registered operators are allowed: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `exists`, `not_exists`.
@@ -332,9 +369,9 @@ Only predefined, registered operators are allowed: `eq`, `ne`, `gt`, `gte`, `lt`
 
 ## 🗄 Database Models & Relationships (Phase 1)
 
-1. **`WorkflowConfig` (`workflow_configs`):** Versioned, immutable workflow rulesets.
-2. **`Application` (`applications`):** Application requests, input payloads, idempotency keys, and statuses.
-3. **`AuditLog` (`audit_logs`):** Append-only audit trail capturing every state transition and evaluation outcome.
+1. **`WorkflowConfig` (`workflow_configs`):** Versioned, immutable workflow rulesets. Uniqueness is enforced on `(workflow_id, version)`. Immutability of historical versions is enforced by application-level validation prohibiting updates to existing versions.
+2. **`Application` (`applications`):** Application requests, input payloads, idempotency keys, payload hashes, retry counts, and statuses. Uniqueness is enforced on `(workflow_id, idempotency_key)`.
+3. **`AuditLog` (`audit_logs`):** Append-only audit trail capturing every state transition and evaluation outcome. Linked to `Application` via foreign key with cascade deletion on application deletion.
 
 ---
 
@@ -357,6 +394,14 @@ To run the full automated test suite (92 tests across Phases 0, 1, 2, 3, and 4):
 pytest -v
 ```
 
+### Test Suite Distribution (92 Passed)
+
+- **Phase 0 (Foundation & Health):** 4 tests in `tests/test_health.py`
+- **Phase 1 (Database, Models & Transactions):** 16 tests in `tests/test_database.py`, `tests/test_models.py`, `tests/test_transactions.py`
+- **Phase 2 (Configurable Rules Engine):** 36 tests in `tests/test_operators.py`, `tests/test_rule_schemas.py`, `tests/test_rule_evaluator.py`, `tests/test_decision_traces.py`
+- **Phase 3 (Workflow Orchestration & API):** 19 tests in `tests/test_application_api.py`, `tests/test_workflow_orchestration.py`, `tests/test_atomic_persistence.py`, `tests/test_idempotency.py`
+- **Phase 4 (Resilience, Retries & Simulator):** 17 tests in `tests/test_resilience_and_retries.py`
+
 ---
 
 ## 📌 Phase Roadmap
@@ -365,4 +410,4 @@ pytest -v
 - [x] **Phase 1:** Database & Persistence (SQLAlchemy 2.0 models, SQLite foreign keys, transactions, session management).
 - [x] **Phase 2:** Configurable Rules Engine (Pydantic v2 schemas, operator whitelist, decision traces, determinism).
 - [x] **Phase 3:** Workflow Orchestration & Application Processing API (`POST /api/v1/applications/`, state management, idempotency replay/conflict, atomic persistence).
-- [x] **Phase 4:** Resilience, Retries & Idempotency (external verification simulator, bounded retries, state machine expansion to RETRY_PENDING / MANUAL_REVIEW, retry API, duplicate protection).
+- [x] **Phase 4:** Resilience, Retries & Idempotency (external verification simulator, bounded retries, state machine expansion to `RETRY_PENDING` / `MANUAL_REVIEW`, retry API, duplicate protection) — **92 passing automated tests**.
