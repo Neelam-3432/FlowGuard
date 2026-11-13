@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     app_description: str = "A Configurable Workflow Decision Platform"
     debug: bool = True
+    testing: bool = False
     api_v1_str: str = "/api/v1"
     database_url: str = "sqlite:///./flowguard.db"
 

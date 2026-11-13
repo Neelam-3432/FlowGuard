@@ -1,9 +1,13 @@
-"""SQLAlchemy database models for FlowGuard.
-
-Future models (e.g., Workflows, Rules, Executions) will be defined here or imported.
-"""
+"""SQLAlchemy database models for FlowGuard."""
 
 from app.core.database import Base
+from app.models.workflow_config import WorkflowConfig
+from app.models.application import Application
+from app.models.audit_log import AuditLog
 
-__all__ = ["Base"]
-
+__all__ = [
+    "Base",
+    "WorkflowConfig",
+    "Application",
+    "AuditLog",
+]
