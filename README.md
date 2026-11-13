@@ -29,9 +29,10 @@ FlowGuard/
 │   │   ├── __init__.py
 │   │   └── v1/
 │   │       ├── __init__.py
-│   │       ├── router.py               # v1 API router aggregator
+│   │       ├── router.py               # v1 API router aggregator (health + applications)
 │   │       └── endpoints/              # Route handlers
 │   │           ├── __init__.py
+│   │           ├── applications.py     # POST /api/v1/applications/ (Phase 3)
 │   │           └── health.py           # Health check endpoint (GET /health)
 │   ├── core/                           # Core system configurations
 │   │   ├── __init__.py
@@ -42,6 +43,11 @@ FlowGuard/
 │   │   ├── application.py              # Application decision entity
 │   │   ├── audit_log.py                # State transition & decision audit trail
 │   │   └── workflow_config.py          # Versioned immutable workflow configuration
+│   ├── orchestration/                  # Workflow Orchestration Layer (Phase 3)
+│   │   ├── __init__.py                 # Orchestration package exports
+│   │   ├── exceptions.py               # Orchestration error hierarchy
+│   │   ├── orchestrator.py             # WorkflowOrchestrator implementation
+│   │   └── state.py                    # ApplicationStatus & state transition validation
 │   ├── rules/                          # Standalone Rules Engine (Phase 2)
 │   │   ├── __init__.py                 # Rules engine public API exports
 │   │   ├── decision.py                 # DecisionResult & RuleEvaluationResult schemas
@@ -51,26 +57,150 @@ FlowGuard/
 │   │   └── schemas.py                  # Pydantic schemas for Mandatory, Threshold, Conditional, Group rules
 │   ├── schemas/                        # System-wide Pydantic schemas
 │   │   ├── __init__.py
+│   │   ├── application.py              # Application submission & response schemas (Phase 3)
 │   │   └── health.py                   # Health check payload schema
-│   └── services/                       # Service layer & atomic transaction support (Phase 1)
+│   └── services/                       # Service layer & atomic persistence (Phase 1)
 │       ├── __init__.py
 │       ├── application_service.py      # Atomic application & audit updates
 │       └── workflow_config_service.py  # Configuration versioning and immutability
 ├── tests/                              # Automated test suite
 │   ├── __init__.py
 │   ├── conftest.py                     # Pytest fixtures (TestClient, isolated DB sessions)
-│   ├── test_database.py                # Database initialization & FK PRAGMA tests
-│   ├── test_decision_traces.py         # Decision trace structure, metadata, & privacy tests
+│   ├── test_application_api.py         # API submission, validation, & HTTP status tests (Phase 3)
+│   ├── test_atomic_persistence.py      # Atomic commit & rollback tests (Phase 3)
+│   ├── test_database.py                # Database initialization & FK PRAGMA tests (Phase 1)
+│   ├── test_decision_traces.py         # Decision trace structure, metadata, & privacy tests (Phase 2)
 │   ├── test_health.py                  # Health and documentation tests (Phase 0)
-│   ├── test_models.py                  # Model insertion, relationships, FKs, constraints
-│   ├── test_operators.py               # Safe operator whitelist & operand type tests
-│   ├── test_rule_evaluator.py          # Comprehensive rules evaluation engine tests
-│   ├── test_rule_schemas.py            # Pydantic schema validation & bounds tests
-│   └── test_transactions.py            # Atomic transaction & rollback tests
+│   ├── test_idempotency.py             # Idempotency replay & conflict tests (Phase 3)
+│   ├── test_models.py                  # Model insertion, relationships, FKs, constraints (Phase 1)
+│   ├── test_operators.py               # Safe operator whitelist & operand type tests (Phase 2)
+│   ├── test_rule_evaluator.py          # Rules evaluation engine tests (Phase 2)
+│   ├── test_rule_schemas.py            # Pydantic schema validation & bounds tests (Phase 2)
+│   ├── test_transactions.py            # Transaction management tests (Phase 1)
+│   └── test_workflow_orchestration.py  # Orchestrator lifecycle & state transition tests (Phase 3)
 ├── .gitignore                          # Git ignore file for Python, SQLite, caches
 ├── README.md                           # Project documentation
 ├── requirements.txt                    # Production and development dependencies
 └── run.py                              # Clean application entry point script
+```
+
+---
+
+## 🔄 Workflow Orchestration & Processing API (Phase 3)
+
+The orchestration layer bridges persisted workflow configurations, the rules engine, and application state transitions into an atomic execution pipeline.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as Applications API (POST /api/v1/applications/)
+    participant Orch as WorkflowOrchestrator
+    participant DB as SQLite DB (SQLAlchemy)
+    participant Engine as RulesEvaluator (Phase 2)
+
+    Client->>API: Submit Application (workflow_id, idempotency_key, input_data)
+    API->>Orch: process_application(db, submission)
+    
+    Orch->>DB: Check existing (workflow_id, idempotency_key)
+    alt Idempotent Replay (Same Payload)
+        DB-->>Orch: Found existing application with identical hash
+        Orch-->>API: Replayed ProcessedApplicationResult
+        API-->>Client: 200 OK (Existing Application & Decision)
+    else Idempotency Conflict (Different Payload)
+        DB-->>Orch: Found existing application with different hash
+        Orch-->>API: Raise IdempotencyConflictError
+        API-->>Client: 409 Conflict
+    else New Submission
+        Orch->>DB: Fetch WorkflowConfig (specific version or active)
+        alt Workflow Not Found
+            Orch-->>API: Raise WorkflowNotFoundError
+            API-->>Client: 404 Not Found
+        end
+        Orch->>Engine: evaluate_rules(config, input_data)
+        Engine-->>Orch: DecisionResult (passed, status, results, traces)
+        Orch->>Orch: Validate state transition (PENDING -> APPROVED/REJECTED)
+        Orch->>DB: Atomic Transaction: Persist Application + AuditLog
+        DB-->>Orch: Committed
+        Orch-->>API: New ProcessedApplicationResult
+        API-->>Client: 201 Created (Application & Decision Summary)
+    end
+```
+
+### Application State Machine:
+- **States:** `PENDING`, `APPROVED`, `REJECTED`, `FAILED`.
+- **Transitions:**
+  - `PENDING` $\to$ `APPROVED` (Rules passed)
+  - `PENDING` $\to$ `REJECTED` (Rules failed)
+  - `PENDING` $\to$ `FAILED` (Processing error)
+  - Terminal states (`APPROVED`, `REJECTED`, `FAILED`) cannot be transitioned again. Attempts raise `InvalidStateTransitionError`.
+
+### Idempotency Behavior:
+- **Same Key + Identical Payload:** Returns `200 OK` with the existing application record. No duplicate application or audit log is created.
+- **Same Key + Different Payload:** Returns `409 Conflict` (`Idempotency key was already used for workflow with different submission data`).
+- **Concurrent Races:** Protected by database-level `UniqueConstraint("workflow_id", "idempotency_key")`. Collisions trigger a rollback and return the replayed record safely.
+
+### API Endpoints:
+
+| Endpoint | Method | Status Codes | Description |
+| :--- | :--- | :--- | :--- |
+| `/api/v1/applications/` | `POST` | `201 Created`, `200 OK`, `400`, `404`, `409`, `422`, `500` | Process application against workflow rules |
+| `/health` | `GET` | `200 OK` | Platform health status |
+| `/docs` | `GET` | `200 OK` | Interactive Swagger UI |
+
+#### Sample Application Submission Request (`POST /api/v1/applications/`):
+
+```json
+{
+  "workflow_id": "loan_approval",
+  "idempotency_key": "app-idemp-001",
+  "input_data": {
+    "applicant_name": "Eleanor Vance",
+    "applicant_age": 29,
+    "annual_income": 450000
+  }
+}
+```
+
+#### Sample Approved Response (`201 Created`):
+
+```json
+{
+  "id": 1,
+  "request_id": "req-4d6102c93054",
+  "workflow_id": "loan_approval",
+  "workflow_config_id": 1,
+  "workflow_version": 1,
+  "idempotency_key": "app-idemp-001",
+  "status": "APPROVED",
+  "decision": {
+    "status": "approved",
+    "passed": true,
+    "total_rules": 2,
+    "passed_rules": 2,
+    "failed_rules": 0,
+    "results": [
+      {
+        "rule_id": "REQ_NAME",
+        "category": "mandatory",
+        "passed": true,
+        "reason": "Mandatory field 'applicant_name' is present and non-empty"
+      },
+      {
+        "rule_id": "MIN_INCOME",
+        "category": "threshold",
+        "passed": true,
+        "reason": "Field 'annual_income' satisfies the threshold requirement (gte 300000)"
+      }
+    ],
+    "metadata": {
+      "mandatory_failed": false,
+      "config_version": 1
+    }
+  },
+  "created_at": "2026-11-13T10:24:26.232939",
+  "updated_at": "2026-11-13T10:24:26.232939"
+}
 ```
 
 ---
@@ -80,83 +210,21 @@ FlowGuard/
 FlowGuard includes a standalone, deterministic, and secure rules engine that evaluates incoming application payloads against versioned workflow configurations without external code execution.
 
 ### Supported Rule Categories:
-
 1. **Mandatory Field Rules (`mandatory`):** Verifies required fields exist, are not null, and (optionally) non-empty strings.
-2. **Threshold Rules (`threshold`):** Performs numeric comparisons (`gt`, `gte`, `lt`, `lte`, `eq`, `ne`) against configured numeric boundaries.
-3. **Conditional Rules (`conditional`):** Evaluates logical implications (`when` antecedent $\to$ `then` assertion). If the precondition is not met, the rule passes vacuously.
+2. **Threshold Rules (`threshold`):** Performs numeric comparisons (`gt`, `gte`, `lt`, `lte`, `eq`, `ne`) against configured boundaries.
+3. **Conditional Rules (`conditional`):** Evaluates logical implications (`when` antecedent $\to$ `then` assertion).
 4. **Group Rules (`group`):** Evaluates composite conditions using `AND` and `OR` combinators with bounded recursion depth (max depth $\le 3$).
 
 ### Safe Operator Whitelist:
-
-No `eval()` or `exec()` is ever used. Only predefined, registered operators are allowed:
-- `eq`: Strict equality (with boolean/integer strictness guard).
-- `ne`: Strict inequality.
-- `gt`, `gte`: Numeric greater than / greater than or equal.
-- `lt`, `lte`: Numeric less than / less than or equal.
-- `in`, `not_in`: Collection membership validation.
-- `exists`, `not_exists`: Field presence and non-null/non-empty checking.
-
-### Decision Aggregation & Traces:
-
-- **All-or-Nothing Rule Precedence:** If any mandatory rule fails, or if any configured rule fails, the overall status is `"rejected"` (`passed=False`). Only when all configured rules pass is the status `"approved"` (`passed=True`).
-- **Privacy Preservation:** Traces record rule identifiers, fields inspected, operators, expected thresholds, and human-readable reasons without dumping raw sensitive payload secrets.
+Only predefined, registered operators are allowed: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `exists`, `not_exists`.
 
 ---
 
 ## 🗄 Database Models & Relationships (Phase 1)
 
-### 1. `WorkflowConfig` (`workflow_configs`)
-- **Fields:** `id` (PK), `workflow_id` (Indexed), `version`, `config_data` (JSON), `is_active`, `created_at`.
-- **Constraints:** Unique `(workflow_id, version)`.
-- **Immutability:** Historical versions are immutable. An event listener and service logic prevent modifying `config_data`, `version`, or `workflow_id` on existing persisted records.
-- **Relationship:** One configuration version can be referenced by multiple applications (`workflow_config.applications`).
-
-### 2. `Application` (`applications`)
-- **Fields:** `id` (PK), `request_id` (Indexed), `workflow_id` (Indexed), `workflow_config_id` (FK to `workflow_configs.id`, `ondelete="RESTRICT"`), `idempotency_key` (Indexed), `payload_hash`, `input_data` (JSON), `status` (Indexed), `retry_count`, `created_at`, `updated_at`.
-- **Constraints:** Unique `(workflow_id, idempotency_key)`.
-- **Relationships:**
-  - Belongs to `WorkflowConfig` (`application.workflow_config`).
-  - Has many `AuditLog` records (`application.audit_logs`, cascade delete).
-
-### 3. `AuditLog` (`audit_logs`)
-- **Fields:** `id` (PK), `application_id` (FK to `applications.id`, `ondelete="CASCADE"`), `event_type` (Indexed), `previous_state`, `new_state`, `details` (JSON), `created_at` (Indexed).
-- **Relationship:** Belongs to `Application` (`audit_log.application`).
-
----
-
-## 🚀 Quick Start & Setup Instructions
-
-### 1. Prerequisites
-
-- Python 3.10+ (Python 3.12 recommended) installed on your system.
-
-### 2. Clone the Repository
-
-```bash
-git clone <repository-url>
-cd FlowGuard
-```
-
-### 3. Create and Activate a Virtual Environment
-
-**On Windows (PowerShell):**
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-**On Linux / macOS:**
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 4. Install Dependencies
-
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+1. **`WorkflowConfig` (`workflow_configs`):** Versioned, immutable workflow rulesets.
+2. **`Application` (`applications`):** Application requests, input payloads, idempotency keys, and statuses.
+3. **`AuditLog` (`audit_logs`):** Append-only audit trail capturing every state transition and evaluation outcome.
 
 ---
 
@@ -173,7 +241,7 @@ Interactive Docs: `http://127.0.0.1:8000/docs`
 
 ## 🧪 Running Tests
 
-To run the complete automated test suite (56 tests across Phase 0, Phase 1, and Phase 2):
+To run the full automated test suite (75 tests across Phases 0, 1, 2, and 3):
 
 ```bash
 pytest -v
@@ -183,8 +251,8 @@ pytest -v
 
 ## 📌 Phase Roadmap
 
-- [x] **Phase 0:** Project scaffolding, modular architecture, dependencies, minimal FastAPI setup, `/health`, `/docs`, `.gitignore`, and entry point.
-- [x] **Phase 1:** Database setup, SQLite foreign key constraints, SQLAlchemy 2.0 models (`Application`, `AuditLog`, `WorkflowConfig`), relationships, immutability, atomic transactions, and test suite.
-- [x] **Phase 2:** Standalone, deterministic, secure Rules Engine, whitelisted operator registry, mandatory/threshold/conditional/group rules, decision traces, and 36 new tests (56 total).
-- [ ] **Phase 3:** Workflow execution lifecycle, audit logging, and state management.
+- [x] **Phase 0:** Foundation (FastAPI setup, `/health`, `/docs`, configuration).
+- [x] **Phase 1:** Database & Persistence (SQLAlchemy 2.0 models, SQLite foreign keys, transactions, session management).
+- [x] **Phase 2:** Configurable Rules Engine (Pydantic v2 schemas, operator whitelist, decision traces, determinism).
+- [x] **Phase 3:** Workflow Orchestration & Application Processing API (`POST /api/v1/applications/`, state management, idempotency replay/conflict, atomic persistence).
 - [ ] **Phase 4:** Advanced operators, validation, and simulated decision testing.
